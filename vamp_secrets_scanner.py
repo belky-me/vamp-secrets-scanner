@@ -1196,6 +1196,12 @@ def parse_args() -> argparse.Namespace:
     al.add_argument("--generate-allowlist",  metavar="FICHERO",
                     help="Generar allowlist JSON a partir de los hallazgos actuales y salir")
 
+    ci = p.add_argument_group("Integración CI/CD")
+    ci.add_argument("--install-hook",        action="store_true",
+                    help="Instalar hook pre-commit git en el directorio objetivo y salir")
+    ci.add_argument("--export-semgrep",      metavar="FICHERO",
+                    help="Exportar patrones como reglas Semgrep YAML y salir")
+
     # Argumentos de informe unificado VSL (--client, --engagement, --auditor,
     # --report-scope, --report-html, --report-pdf)
     from vampsec_report import add_report_args
@@ -1278,6 +1284,135 @@ def _findings_vsl(findings: List["Finding"], target: str) -> list:
     return hallazgos
 
 
+# =============================================================================
+# INTEGRACIÓN CI/CD — HOOKS Y EXPORTACIÓN
+# =============================================================================
+
+def _install_pre_commit_hook(target: Path) -> None:
+    """
+    Instala un hook pre-commit de git en el repositorio objetivo.
+
+    El hook ejecuta vamp-secrets-scanner sobre el árbol de trabajo completo
+    antes de cada commit, bloqueando el push si encuentra hallazgos MEDIUM+.
+    El usuario puede saltarse el hook con `git commit --no-verify` cuando lo
+    necesite (p. ej. para commits de emergencia o falsos positivos conocidos).
+
+    Parámetros
+    ----------
+    target : Path  — Directorio raíz del repositorio git
+    """
+    git_dir = target / ".git"
+    if not git_dir.is_dir():
+        console.print(f"[red]  ERROR: {target} no es un repositorio git (falta .git/).[/]")
+        sys.exit(1)
+
+    hook_path = git_dir / "hooks" / "pre-commit"
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tool_path = Path(__file__).resolve()
+    hook_script = f"""#!/usr/bin/env bash
+# Hook pre-commit instalado por vamp-secrets-scanner
+# © VampSecure Studios — VampSecure Labs Security Research Division
+#
+# Bloquea commits si se detectan secretos con severidad MEDIUM o superior.
+# Para omitir puntualmente: git commit --no-verify
+set -euo pipefail
+
+SCANNER="{tool_path}"
+TARGET="$(git rev-parse --show-toplevel 2>/dev/null || echo ".")"
+
+if [ ! -f "$SCANNER" ]; then
+    echo "[vamp-secrets-scanner] AVISO: escáner no encontrado en $SCANNER" >&2
+    exit 0
+fi
+
+echo "[vamp-secrets-scanner] Escaneando secretos antes del commit..."
+python3 "$SCANNER" "$TARGET" --min-severity MEDIUM 2>&1
+CODE=$?
+
+if [ $CODE -ge 1 ]; then
+    echo "" >&2
+    echo "[vamp-secrets-scanner] ⛔  Commit BLOQUEADO — secretos encontrados (MEDIUM+)" >&2
+    echo "   Elimina los secretos, rótalos y vuelve a intentarlo." >&2
+    echo "   Para omitir este check (úsalo con cuidado): git commit --no-verify" >&2
+    exit 1
+fi
+
+exit 0
+"""
+    hook_path.write_text(hook_script, encoding="utf-8")
+    hook_path.chmod(0o755)
+    console.print(f"[bold green]  ✔ Hook pre-commit instalado: {hook_path}[/]")
+    console.print(f"[dim]  Cada commit escaneará el árbol de trabajo completo (MEDIUM+).[/]")
+    console.print(f"[dim]  Para desinstalar: rm {hook_path}[/]")
+
+
+def _export_semgrep_rules(output_file: str) -> None:
+    """
+    Exporta todos los patrones del escáner como reglas Semgrep YAML.
+
+    Genera un fichero importable directamente con:
+        semgrep --config <fichero> <directorio>
+
+    Los niveles de severidad se mapean así:
+        CRITICAL → ERROR  |  HIGH/MEDIUM → WARNING  |  LOW → INFO
+
+    Usa block literals YAML (|-) para los patrones regex: evita escapes y
+    garantiza compatibilidad con expresiones regulares complejas.
+
+    Parámetros
+    ----------
+    output_file : str  — Ruta del fichero YAML de salida
+    """
+    SEV_MAP = {"CRITICAL": "ERROR", "HIGH": "WARNING", "MEDIUM": "WARNING", "LOW": "INFO"}
+
+    def _slug(name: str) -> str:
+        import re as _re
+        return _re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+    def _yaml_str(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    lines = [
+        "# Reglas Semgrep generadas automáticamente por vamp-secrets-scanner",
+        "# © VampSecure Studios — VampSecure Labs Security Research Division",
+        "# Uso: semgrep --config <este-fichero> <directorio-objetivo>",
+        "# Documentación: https://semgrep.dev/docs/",
+        "",
+        "rules:",
+    ]
+
+    for pat in _RAW_PATTERNS:
+        rule_id   = f"vampsec-{_slug(pat['name'])}"
+        sev       = SEV_MAP.get(pat["severity"], "WARNING")
+        regex     = pat["regex"]
+        category  = pat["category"]
+        msg_title = pat["name"]
+
+        lines += [
+            f"  - id: {rule_id}",
+            f"    patterns:",
+            f"      - pattern-regex: |-",
+            f"          {regex}",
+            f"    message: >-",
+            f"      {msg_title} detectado [{category}].",
+            f"      Eliminar inmediatamente y rotar las credenciales afectadas.",
+            f"    severity: {sev}",
+            f"    languages:",
+            f"      - generic",
+            f"    metadata:",
+            f'      category: "{category}"',
+            f"      vsl_severity: {pat['severity']}",
+            f"      source: vamp-secrets-scanner",
+            f"      fix: Eliminar el secreto del código y rotar credenciales.",
+            "",
+        ]
+
+    Path(output_file).write_text("\n".join(lines), encoding="utf-8")
+    console.print(f"[bold green]  ✔ {len(_RAW_PATTERNS)} reglas Semgrep exportadas → {output_file}[/]")
+    console.print(f"[dim]  Ejecutar: semgrep --config {output_file} <directorio>[/]")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Punto de entrada
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1288,12 +1423,21 @@ def main() -> None:
     args   = parse_args()
     target = Path(args.target).resolve()
 
+    # ── Flags de acción directa (exportar/instalar) — no requieren escaneo ──
+    if getattr(args, "export_semgrep", None):
+        _export_semgrep_rules(args.export_semgrep)
+        sys.exit(0)
+
     if not target.exists():
         console.print(f"[red]  ERROR: {target} no existe.[/]")
         sys.exit(1)
     if not target.is_dir():
         console.print(f"[red]  ERROR: {target} no es un directorio.[/]")
         sys.exit(1)
+
+    if getattr(args, "install_hook", False):
+        _install_pre_commit_hook(target)
+        sys.exit(0)
 
     # Añadir directorios extra a excluir
     for d in args.exclude_dir:
