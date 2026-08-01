@@ -767,6 +767,8 @@ def parse_args() -> argparse.Namespace:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    console.print(BANNER, style="bold magenta")
+
     args   = parse_args()
     target = Path(args.target).resolve()
 
@@ -783,7 +785,6 @@ def main() -> None:
 
     min_sev = Severity.CRITICAL if args.only_critical else Severity(args.min_severity)
 
-    console.print(BANNER, style="bold green")
     console.print(f"  Objetivo: [cyan]{target}[/]\n")
 
     # ── Fase 1: descubrir ficheros ────────────────────────────────────────────
