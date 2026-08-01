@@ -90,6 +90,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -99,6 +100,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from rich.console import Console
+from rich.markup import escape as markup_escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -107,7 +109,7 @@ from rich.text import Text
 # Constantes
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION   = "1.0"
+VERSION   = "2.0"
 TOOL_NAME = "vamp-secrets-scanner"
 
 BANNER = r"""
@@ -116,7 +118,7 @@ BANNER = r"""
   \ V / (_| | / _ \ | |\/| | |_) \___ \| |___| | | | |_) |  _|   | |     / _ \ |  _ \___ \
    | |  \__, |/ ___ \| |  | |  __/ ___) |___  | |_| |  _ <| |___  | |___ / ___ \| |_) |__) |
    |_|     /_/_/   \_|_|  |_|_|   |____/\____|\___/|_| \_|_____| |_____/_/   \_|____/____/
-        by VampSecure Studios · vamp-secrets-scanner v1.0 · Static Secrets & Credentials Scanner
+        by VampSecure Studios · vamp-secrets-scanner v2.0 · Static Secrets & Git History Scanner
         ─────────────────────────────────────────────────────────────────────────────────────────
         USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal
 """
@@ -416,7 +418,7 @@ _SEVERITY_ORDER = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, S
 
 @dataclass
 class Finding:
-    """Hallazgo de secreto en un fichero."""
+    """Hallazgo de secreto en un fichero o en el historial git."""
     file:       str
     line_no:    int
     pattern:    str
@@ -425,6 +427,11 @@ class Finding:
     preview:    str           # extracto censurado
     context:    List[str]     # líneas de contexto (±2)
     fingerprint: str          # hash del valor detectado (para dedup)
+    # Campos opcionales para hallazgos de historial git
+    git_commit: Optional[str] = None  # hash del commit donde apareció
+    git_author: Optional[str] = None  # autor del commit
+    git_date:   Optional[str] = None  # fecha ISO del commit
+    allowlisted: bool = False          # ignorado por la allowlist
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -572,6 +579,360 @@ def scan_file(path: Path, entropy_threshold: float) -> List[Finding]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Fase 2b — Escaneo de historial Git
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_git_repo(path: Path) -> bool:
+    """Devuelve True si el directorio es un repositorio git."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-dir"],
+        cwd=path, capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def scan_git_history(
+    repo_path: Path,
+    entropy_threshold: float,
+    max_commits: int = 0,
+) -> List[Finding]:
+    """
+    Escanea el historial completo de git buscando secretos en las líneas añadidas.
+
+    Estrategia:
+      1. Obtiene todos los commits (todos los branches) con `git log --all`.
+      2. Para cada commit, extrae el diff completo de líneas añadidas (+).
+      3. Aplica los mismos patrones regex y análisis de entropía que el escaneo
+         de ficheros, pero registrando también el hash del commit, autor y fecha.
+
+    Esto detecta secretos que fueron introducidos y luego borrados del árbol
+    actual, que son invisibles para el escaneo de ficheros estándar.
+
+    Parámetros
+    ----------
+    repo_path:         Ruta al repositorio git.
+    entropy_threshold: Umbral de Shannon (float("inf") = desactivado).
+    max_commits:       Límite de commits a procesar. 0 = sin límite.
+    """
+    if not _is_git_repo(repo_path):
+        return []
+
+    # Obtener lista de commits: hash, autor, fecha ISO
+    log_fmt = "%H\x1f%ae\x1f%aI"
+    log_cmd = ["git", "log", "--all", "--no-merges", f"--format={log_fmt}"]
+    if max_commits > 0:
+        log_cmd += [f"-n{max_commits}"]
+
+    log_result = subprocess.run(
+        log_cmd, cwd=repo_path, capture_output=True, text=True, errors="replace",
+    )
+    if log_result.returncode != 0:
+        return []
+
+    commit_lines = [l for l in log_result.stdout.splitlines() if l.strip()]
+    findings: List[Finding] = []
+    seen_fps: Set[str] = set()
+
+    # Regexes auxiliares para parsear el diff
+    FILE_RE   = re.compile(r"^\+\+\+ b/(.+)$")
+    ADDED_RE  = re.compile(r"^\+(?!\+\+)(.*)$")  # línea añadida (no la cabecera +++)
+    LINENO_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
+
+    _ENTROPY_RE = re.compile(
+        r"""(?:=|:|:=)\s*['"]?([A-Za-z0-9+/=\-_.~]{20,})['"]?""",
+        re.MULTILINE,
+    )
+    _NOISE_RE = re.compile(
+        r"^(?:[0-9a-f]{32,}|[0-9A-Fa-f\-]{36}|https?://|/[a-z])$",
+        re.IGNORECASE,
+    )
+
+    for raw in commit_lines:
+        parts = raw.split("\x1f")
+        if len(parts) != 3:
+            continue
+        commit_hash, author, date = parts
+
+        # Obtener el diff completo del commit (solo líneas añadidas para velocidad)
+        diff_result = subprocess.run(
+            ["git", "show", "--no-notes", "--format=", "-U0", commit_hash],
+            cwd=repo_path, capture_output=True, text=True, errors="replace",
+        )
+        if diff_result.returncode != 0:
+            continue
+
+        current_file = ""
+        current_line = 0
+
+        for diff_line in diff_result.stdout.splitlines():
+            # Detectar qué fichero estamos analizando
+            m_file = FILE_RE.match(diff_line)
+            if m_file:
+                current_file = m_file.group(1)
+                continue
+
+            # Actualizar número de línea desde el header @@ +N @@
+            m_lineno = LINENO_RE.match(diff_line)
+            if m_lineno:
+                current_line = int(m_lineno.group(1)) - 1
+                continue
+
+            m_added = ADDED_RE.match(diff_line)
+            if not m_added:
+                continue
+
+            line_content = m_added.group(1)
+            current_line += 1
+
+            # ── Patrones regex ────────────────────────────────────────────────
+            for pat in SECRET_PATTERNS:
+                for m in pat["compiled"].finditer(line_content):
+                    value = m.group(0)
+                    # El fingerprint incluye el commit para no suprimir el mismo
+                    # secreto en commits distintos (puede ser la misma clave rotada).
+                    fp = _fingerprint(value, f"git:{pat['name']}")
+                    if fp in seen_fps:
+                        continue
+                    seen_fps.add(fp)
+                    findings.append(Finding(
+                        file        = current_file,
+                        line_no     = current_line,
+                        pattern     = pat["name"],
+                        category    = pat["category"],
+                        severity    = Severity(pat["severity"]),
+                        preview     = _censor(value),
+                        context     = [f"  git:{commit_hash[:8]} — {line_content.rstrip()}"],
+                        fingerprint = fp,
+                        git_commit  = commit_hash,
+                        git_author  = author,
+                        git_date    = date,
+                    ))
+
+            # ── Entropía ──────────────────────────────────────────────────────
+            if entropy_threshold < float("inf"):
+                for m in _ENTROPY_RE.finditer(line_content):
+                    candidate = m.group(1)
+                    if _NOISE_RE.match(candidate):
+                        continue
+                    entropy = _shannon_entropy(candidate)
+                    if entropy < entropy_threshold:
+                        continue
+                    fp = _fingerprint(candidate, f"git:HIGH_ENTROPY:{commit_hash[:8]}")
+                    if fp in seen_fps:
+                        continue
+                    seen_fps.add(fp)
+                    findings.append(Finding(
+                        file        = current_file,
+                        line_no     = current_line,
+                        pattern     = f"Alta Entropía (H={entropy:.2f} bits)",
+                        category    = "Entropía",
+                        severity    = Severity.LOW,
+                        preview     = _censor(candidate),
+                        context     = [f"  git:{commit_hash[:8]} — {line_content.rstrip()}"],
+                        fingerprint = fp,
+                        git_commit  = commit_hash,
+                        git_author  = author,
+                        git_date    = date,
+                    ))
+
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Allowlist — filtro de falsos positivos conocidos
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_allowlist(path: str) -> List[dict]:
+    """
+    Carga una allowlist desde un fichero JSON.
+
+    Formato esperado:
+    {
+      "allowlist": [
+        {"fingerprint": "abc123def456"},
+        {"pattern": "DNI español", "file": "tests/fixtures/datos_prueba.py"},
+        {"pattern": "Alta Entropía*"},
+        {"file": "tests/fixtures/"}
+      ]
+    }
+
+    Cada entrada puede filtrar por 'fingerprint' exacto, por 'pattern'
+    (admite glob parcial con *), por 'file' (prefijo de ruta) o
+    por combinación pattern + file.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data.get("allowlist", [])
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[yellow]  Aviso: no se pudo leer la allowlist '{path}': {exc}[/]")
+        return []
+
+
+def apply_allowlist(findings: List[Finding], allowlist: List[dict]) -> List[Finding]:
+    """
+    Marca como `allowlisted=True` los hallazgos que coincidan con alguna
+    entrada de la allowlist. Devuelve la lista con el flag actualizado.
+    """
+    if not allowlist:
+        return findings
+
+    def _matches(f: Finding, entry: dict) -> bool:
+        # Coincidencia por fingerprint exacto
+        if "fingerprint" in entry:
+            return f.fingerprint == entry["fingerprint"]
+        # Coincidencia por patrón (glob simple con *)
+        pattern_ok = True
+        if "pattern" in entry:
+            pat = entry["pattern"]
+            if pat.endswith("*"):
+                pattern_ok = f.pattern.startswith(pat[:-1])
+            else:
+                pattern_ok = f.pattern == pat
+        # Coincidencia por fichero (prefijo)
+        file_ok = True
+        if "file" in entry:
+            file_ok = f.file.startswith(entry["file"]) or entry["file"] in f.file
+        return pattern_ok and file_ok
+
+    for f in findings:
+        for entry in allowlist:
+            if _matches(f, entry):
+                f.allowlisted = True
+                break
+    return findings
+
+
+def generate_allowlist(findings: List[Finding], path: str) -> None:
+    """
+    Genera un fichero allowlist JSON a partir de los hallazgos actuales.
+    Útil para establecer un baseline inicial en repositorios heredados.
+    """
+    entries = [{"fingerprint": f.fingerprint, "pattern": f.pattern, "file": f.file}
+               for f in findings]
+    out = {
+        "_generado_por": f"{TOOL_NAME} v{VERSION}",
+        "_fecha": datetime.now(timezone.utc).isoformat(),
+        "_nota": "Edita esta allowlist para suprimir falsos positivos conocidos. "
+                 "Elimina entradas para que vuelvan a reportarse.",
+        "allowlist": entries,
+    }
+    Path(path).write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    console.print(f"[green]  ✔ Allowlist generada en {path} ({len(entries)} entradas)[/]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exportación SARIF 2.1.0
+# ─────────────────────────────────────────────────────────────────────────────
+
+def export_sarif(findings: List[Finding], target: str, path: str) -> None:
+    """
+    Exporta hallazgos en formato SARIF 2.1.0 (Static Analysis Results
+    Interchange Format). Compatible con GitHub Advanced Security, VS Code
+    SARIF Viewer y herramientas de CI/CD que consuman este formato.
+
+    Mapeo de severidad:
+      CRITICAL → level: "error",   rank: 9.5
+      HIGH     → level: "error",   rank: 7.5
+      MEDIUM   → level: "warning", rank: 5.0
+      LOW      → level: "note",    rank: 2.0
+    """
+    _SEV_TO_SARIF = {
+        "CRITICAL": ("error",   9.5),
+        "HIGH":     ("error",   7.5),
+        "MEDIUM":   ("warning", 5.0),
+        "LOW":      ("note",    2.0),
+    }
+
+    # Construir catálogo de reglas a partir de los patrones usados
+    rules_seen: Dict[str, dict] = {}
+    for f in findings:
+        rule_id = re.sub(r"[^A-Za-z0-9\-_]", "-", f.pattern)[:64]
+        if rule_id not in rules_seen:
+            level, rank = _SEV_TO_SARIF.get(f.severity.value, ("note", 2.0))
+            rules_seen[rule_id] = {
+                "id": rule_id,
+                "name": f.pattern,
+                "shortDescription": {"text": f"{f.pattern} ({f.category})"},
+                "defaultConfiguration": {
+                    "level": level,
+                    "rank": rank,
+                },
+                "properties": {
+                    "category": f.category,
+                    "severity": f.severity.value,
+                    "tags": ["security", "secrets"],
+                },
+            }
+
+    # Construir resultados
+    results = []
+    target_uri = Path(target).as_uri()
+    for f in findings:
+        if f.allowlisted:
+            continue
+        rule_id = re.sub(r"[^A-Za-z0-9\-_]", "-", f.pattern)[:64]
+        level, _ = _SEV_TO_SARIF.get(f.severity.value, ("note", 2.0))
+        # URI relativa al workspace
+        try:
+            rel_file = str(Path(f.file).relative_to(target)).replace("\\", "/")
+        except ValueError:
+            rel_file = f.file.replace("\\", "/")
+        result_entry: dict = {
+            "ruleId": rule_id,
+            "level": level,
+            "message": {"text": f"{f.pattern} detectado en {rel_file}:{f.line_no} — {f.preview}"},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {
+                        "uri": rel_file,
+                        "uriBaseId": "%SRCROOT%",
+                    },
+                    "region": {"startLine": f.line_no},
+                }
+            }],
+            "fingerprints": {"vamp-secrets-scanner/v1": f.fingerprint},
+            "properties": {
+                "severity": f.severity.value,
+                "category": f.category,
+                "preview":  f.preview,
+            },
+        }
+        # Información git si disponible
+        if f.git_commit:
+            result_entry["properties"]["gitCommit"] = f.git_commit
+            result_entry["properties"]["gitAuthor"] = f.git_author or ""
+            result_entry["properties"]["gitDate"]   = f.git_date or ""
+        results.append(result_entry)
+
+    sarif_doc = {
+        "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": TOOL_NAME,
+                    "version": VERSION,
+                    "informationUri": "https://github.com/belky-me/vamp-secrets-scanner",
+                    "organization": "VampSecure Studios",
+                    "rules": list(rules_seen.values()),
+                }
+            },
+            "results": results,
+            "originalUriBaseIds": {
+                "%SRCROOT%": {"uri": target_uri + "/"},
+            },
+            "properties": {
+                "generated": datetime.now(timezone.utc).isoformat(),
+                "target": target,
+            },
+        }],
+    }
+
+    Path(path).write_text(json.dumps(sarif_doc, indent=2, ensure_ascii=False), encoding="utf-8")
+    console.print(f"[dim]  SARIF → {path} ({len(results)} resultados)[/]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Fase 3 — Clasificación e informe Rich
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -614,11 +975,11 @@ def build_results_table(findings: List[Finding], base: Path) -> Table:
             rel = Path(f.file)
         table.add_row(
             Text(label, style=sty),
-            str(rel),
+            Text(str(rel)),
             str(f.line_no),
-            f.pattern,
-            f.category,
-            f.preview,
+            Text(f.pattern),
+            Text(f.category),
+            Text(f.preview),
         )
     return table
 
@@ -636,11 +997,11 @@ def print_critical_panels(findings: List[Finding], base: Path) -> None:
             rel = Path(f.file)
         ctx = "\n".join(f.context)
         body = (
-            f"[bold white]Fichero:[/]   {rel}:{f.line_no}\n"
-            f"[bold white]Patrón:[/]    {f.pattern}\n"
-            f"[bold white]Categoría:[/] {f.category}\n"
-            f"[bold white]Extracto:[/]  [yellow]{f.preview}[/]\n\n"
-            f"[dim]{ctx}[/]"
+            f"[bold white]Fichero:[/]   {markup_escape(str(rel))}:{f.line_no}\n"
+            f"[bold white]Patrón:[/]    {markup_escape(f.pattern)}\n"
+            f"[bold white]Categoría:[/] {markup_escape(f.category)}\n"
+            f"[bold white]Extracto:[/]  [yellow]{markup_escape(f.preview)}[/]\n\n"
+            f"[dim]{markup_escape(ctx)}[/]"
         )
         console.print(Panel(body,
             title=f"[bold red]⚠ CRÍTICO: {f.pattern}[/]",
@@ -781,18 +1142,20 @@ function toggle(row){{
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="vamp-secrets-scanner",
-        description="VampSecure Labs — Escáner Estático de Secretos y Credenciales",
+        description="VampSecure Labs — Escáner Estático de Secretos, PII e Historial Git",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Ejemplos:\n"
             "  # Escanear directorio actual\n"
             "  python vamp_secrets_scanner.py .\n\n"
-            "  # Escanear repo con salida completa\n"
-            "  python vamp_secrets_scanner.py /ruta/al/repo -o hallazgos.json --html informe.html\n\n"
-            "  # Solo críticos y altos, sin ruido de entropía\n"
-            "  python vamp_secrets_scanner.py . --min-severity HIGH --no-entropy\n\n"
-            "  # Todos los ficheros, máxima profundidad 3\n"
-            "  python vamp_secrets_scanner.py . --all-extensions --max-depth 3\n"
+            "  # Escanear repo incluyendo historial git completo\n"
+            "  python vamp_secrets_scanner.py /ruta/al/repo --git-history\n\n"
+            "  # Solo críticos y altos, exportar SARIF para GitHub Actions\n"
+            "  python vamp_secrets_scanner.py . --min-severity HIGH --sarif results.sarif\n\n"
+            "  # Generar allowlist desde hallazgos actuales (baseline inicial)\n"
+            "  python vamp_secrets_scanner.py . --generate-allowlist baseline.json\n\n"
+            "  # Aplicar allowlist en CI para ignorar falsos positivos conocidos\n"
+            "  python vamp_secrets_scanner.py . --allowlist baseline.json --sarif results.sarif\n"
         ),
     )
     p.add_argument("target",
@@ -803,6 +1166,8 @@ def parse_args() -> argparse.Namespace:
                      help="Exportar hallazgos a JSON")
     out.add_argument("--html",               metavar="FICHERO",
                      help="Exportar informe HTML dark-theme")
+    out.add_argument("--sarif",              metavar="FICHERO",
+                     help="Exportar resultados en formato SARIF 2.1.0 (GitHub Actions / VS Code)")
     out.add_argument("--min-severity",
                      choices=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
                      default="LOW",
@@ -820,6 +1185,16 @@ def parse_args() -> argparse.Namespace:
                      help="Umbral de entropía en bits/símbolo (default: 4.5)")
     fil.add_argument("--exclude-dir",        action="append", default=[], metavar="DIR",
                      help="Directorios adicionales a excluir (repetible)")
+    git = p.add_argument_group("Historial Git")
+    git.add_argument("--git-history",        action="store_true",
+                     help="Escanear el historial completo de commits git (detecta secretos borrados)")
+    git.add_argument("--max-commits",        type=int, default=0, metavar="N",
+                     help="Limitar el escaneo de historial a los N commits más recientes (0 = sin límite)")
+    al = p.add_argument_group("Allowlist")
+    al.add_argument("--allowlist",           metavar="FICHERO",
+                    help="Fichero JSON con falsos positivos a ignorar")
+    al.add_argument("--generate-allowlist",  metavar="FICHERO",
+                    help="Generar allowlist JSON a partir de los hallazgos actuales y salir")
     return p.parse_args()
 
 
@@ -845,8 +1220,15 @@ def main() -> None:
         EXCLUDE_DIRS.add(d)
 
     min_sev = Severity.CRITICAL if args.only_critical else Severity(args.min_severity)
+    entropy_threshold = float("inf") if args.no_entropy else args.entropy_threshold
 
-    console.print(f"  Objetivo: [cyan]{target}[/]\n")
+    console.print(f"  Objetivo: [cyan]{target}[/]")
+    if args.git_history:
+        console.print(f"  Modo: [bold yellow]árbol actual + historial git[/]"
+                      + (f" (últimos {args.max_commits} commits)" if args.max_commits else ""))
+    console.print()
+
+    all_findings: List[Finding] = []
 
     # ── Fase 1: descubrir ficheros ────────────────────────────────────────────
     console.print("[bold cyan]  FASE 1[/] — Descubriendo ficheros en alcance...")
@@ -854,18 +1236,24 @@ def main() -> None:
     total_bytes = sum(f.stat().st_size for f in files if f.exists())
     console.print(f"[dim]  {len(files)} ficheros · {total_bytes / 1024:.1f} KB en alcance[/]\n")
 
-    # ── Fase 2+3: escaneo ────────────────────────────────────────────────────
-    console.print("[bold cyan]  FASE 2[/] — Escaneando patrones y entropía...")
-    all_findings: List[Finding] = []
-
-    entropy_threshold = float("inf") if args.no_entropy else args.entropy_threshold
-
-    with console.status("[bold green]Analizando...[/]", spinner="dots"):
+    # ── Fase 2a: escaneo de ficheros ──────────────────────────────────────────
+    console.print("[bold cyan]  FASE 2[/] — Escaneando patrones y entropía (árbol actual)...")
+    with console.status("[bold green]Analizando ficheros...[/]", spinner="dots"):
         for f in files:
-            findings = scan_file(f, entropy_threshold)
-            all_findings.extend(findings)
+            all_findings.extend(scan_file(f, entropy_threshold))
 
-    # Deduplicar globalmente por fingerprint
+    # ── Fase 2b: escaneo de historial git (opcional) ──────────────────────────
+    if args.git_history:
+        if _is_git_repo(target):
+            console.print("[bold cyan]  FASE 2b[/] — Escaneando historial git...")
+            with console.status("[bold green]Analizando commits...[/]", spinner="dots"):
+                git_findings = scan_git_history(target, entropy_threshold, args.max_commits)
+            console.print(f"[dim]  {len(git_findings)} hallazgos en historial git[/]\n")
+            all_findings.extend(git_findings)
+        else:
+            console.print("[yellow]  Aviso: --git-history solicitado pero el directorio no es un repo git[/]\n")
+
+    # ── Deduplicación y filtrado ──────────────────────────────────────────────
     seen: Set[str] = set()
     unique: List[Finding] = []
     for f in all_findings:
@@ -873,14 +1261,30 @@ def main() -> None:
             seen.add(f.fingerprint)
             unique.append(f)
 
-    # Filtrar por severidad mínima
+    # ── Allowlist ─────────────────────────────────────────────────────────────
+    if args.allowlist:
+        allowlist = load_allowlist(args.allowlist)
+        unique = apply_allowlist(unique, allowlist)
+        n_suppressed = sum(1 for f in unique if f.allowlisted)
+        if n_suppressed:
+            console.print(f"[dim]  {n_suppressed} hallazgos suprimidos por la allowlist[/]")
+
+    # ── Filtrar por severidad y allowlist ─────────────────────────────────────
     filtered = [
         f for f in unique
         if _SEVERITY_ORDER[f.severity] <= _SEVERITY_ORDER[min_sev]
+        and not f.allowlisted
     ]
 
     console.print(f"[dim]  {len(unique)} hallazgos únicos · {len(filtered)} tras filtro de severidad[/]\n")
 
+    # ── Generar allowlist baseline (si se pide, exportar y salir) ─────────────
+    if args.generate_allowlist:
+        generate_allowlist(filtered, args.generate_allowlist)
+        console.print("[dim]  Usa --allowlist con ese fichero para suprimir los hallazgos en próximas ejecuciones.[/]")
+        sys.exit(0)
+
+    # ── Mostrar resultados ────────────────────────────────────────────────────
     if not filtered:
         console.print("[bold green]  ✓ Sin hallazgos en el rango de severidad seleccionado.[/]")
     else:
@@ -892,18 +1296,22 @@ def main() -> None:
     n_high = sum(1 for f in filtered if f.severity == Severity.HIGH)
     n_med  = sum(1 for f in filtered if f.severity == Severity.MEDIUM)
     n_low  = sum(1 for f in filtered if f.severity == Severity.LOW)
+    n_git  = sum(1 for f in filtered if f.git_commit)
 
     sev_style = "bold red" if n_crit > 0 else ("bold yellow" if n_high > 0 else "bold green")
-    console.print(
-        f"\n[{sev_style}]  RESUMEN: {len(filtered)} hallazgos · "
-        f"{n_crit} CRÍTICO · {n_high} ALTO · {n_med} MEDIO · {n_low} BAJO[/]"
-    )
+    resumen = (f"\n[{sev_style}]  RESUMEN: {len(filtered)} hallazgos · "
+               f"{n_crit} CRÍTICO · {n_high} ALTO · {n_med} MEDIO · {n_low} BAJO")
+    if n_git:
+        resumen += f" · {n_git} en historial git"
+    console.print(resumen + "[/]")
 
     # ── Exportación ───────────────────────────────────────────────────────────
     if args.output:
         export_json(filtered, str(target), args.output)
     if args.html:
         export_html(filtered, str(target), args.html)
+    if args.sarif:
+        export_sarif(filtered, str(target), args.sarif)
 
     # Exit codes útiles en CI/CD
     if n_crit > 0:
