@@ -1195,7 +1195,87 @@ def parse_args() -> argparse.Namespace:
                     help="Fichero JSON con falsos positivos a ignorar")
     al.add_argument("--generate-allowlist",  metavar="FICHERO",
                     help="Generar allowlist JSON a partir de los hallazgos actuales y salir")
+
+    # Argumentos de informe unificado VSL (--client, --engagement, --auditor,
+    # --report-scope, --report-html, --report-pdf)
+    from vampsec_report import add_report_args
+    add_report_args(p)
+
     return p.parse_args()
+
+
+# =============================================================================
+# CONVERSOR A FORMATO DE INFORME UNIFICADO VSL
+# =============================================================================
+
+def _findings_vsl(findings: List["Finding"], target: str) -> list:
+    """
+    Convierte hallazgos de secretos al formato Finding unificado de VampSecure Labs.
+
+    Incluye todos los hallazgos con severidad MEDIUM, HIGH o CRITICAL.
+    Los hallazgos LOW se omiten del informe de cliente para mantener el foco.
+
+    Parámetros
+    ----------
+    findings : List[Finding]  — Lista de hallazgos ya filtrados y deduplicados
+    target   : str            — Ruta raíz del objetivo (para calcular rutas relativas)
+
+    Retorna
+    -------
+    List[Finding]  — Lista de hallazgos en formato VSL con prefijo SEC-NNN
+    """
+    from vampsec_report import Finding as VSLFinding
+
+    SEVERIDADES_INCLUIDAS = {"CRITICAL", "HIGH", "MEDIUM"}
+    hallazgos: list = []
+    n = 0
+
+    for f in findings:
+        sev_val = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+        if sev_val not in SEVERIDADES_INCLUIDAS:
+            continue
+        n += 1
+
+        # Ruta relativa para no exponer rutas absolutas de máquina en el informe
+        try:
+            ruta_relativa = str(Path(f.file).relative_to(target))
+        except ValueError:
+            ruta_relativa = f.file
+
+        # Evidencia: ubicación, patrón, extracto censurado + historial git si aplica
+        partes_evidencia = [
+            f"Fichero: {ruta_relativa}:{f.line_no}",
+            f"Patrón: {f.pattern}",
+            f"Categoría: {f.category}",
+            f"Extracto (censurado): {f.preview}",
+        ]
+        if f.git_commit:
+            partes_evidencia.append(
+                f"Commit git: {f.git_commit[:12]} "
+                + (f"por {f.git_author}" if f.git_author else "")
+                + (f" ({f.git_date})" if f.git_date else "")
+            )
+
+        hallazgos.append(VSLFinding(
+            id          = f"SEC-{n:03d}",
+            title       = f"{f.pattern} detectado en {ruta_relativa}",
+            severity    = sev_val,
+            description = (
+                f"Se ha detectado el patrón '{f.pattern}' (categoría: {f.category}) "
+                f"en el fichero {ruta_relativa} línea {f.line_no}. "
+                "La presencia de este secreto en el código fuente supone un riesgo de exposición."
+            ),
+            evidence    = " | ".join(partes_evidencia),
+            affected    = ruta_relativa,
+            remediation = (
+                f"Eliminar el secreto del fichero '{ruta_relativa}', rotar las credenciales "
+                f"afectadas y añadir la ruta a .gitignore. Si aparece en historial git, "
+                "limpiar con git-filter-repo o BFG Repo Cleaner."
+            ),
+            tags        = ["secrets", "sast", f.category.split("·")[0].strip().lower()],
+        ))
+
+    return hallazgos
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1312,6 +1392,18 @@ def main() -> None:
         export_html(filtered, str(target), args.html)
     if args.sarif:
         export_sarif(filtered, str(target), args.sarif)
+
+    # ── Informe unificado VSL (cliente) ───────────────────────────────────────
+    if getattr(args, "report_html", None) or getattr(args, "report_pdf", None):
+        from vampsec_report import VampSecReport, meta_from_args
+        meta   = meta_from_args(args, tool="vamp-secrets-scanner", version=VERSION)
+        report = VampSecReport(meta=meta, findings=_findings_vsl(filtered, str(target)))
+        if args.report_html:
+            report.to_html_client(args.report_html)
+            console.print(f"[bold green]  ✔ Informe cliente HTML guardado: {args.report_html}[/]")
+        if args.report_pdf:
+            report.to_pdf(args.report_pdf)
+            console.print(f"[bold green]  ✔ Informe cliente PDF guardado: {args.report_pdf}[/]")
 
     # Exit codes útiles en CI/CD
     if n_crit > 0:
