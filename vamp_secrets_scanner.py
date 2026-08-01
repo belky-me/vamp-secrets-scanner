@@ -13,7 +13,7 @@ configuración y cualquier árbol de directorios. Orientada a auditorías
 de seguridad, revisiones de código previas a despliegue y detección de
 fugas de credenciales antes de publicar un repositorio.
 
-Detecta más de 60 patrones de secretos reales organizados en categorías:
+Detecta más de 80 patrones de secretos y datos sensibles organizados en categorías:
   · Claves de nube (AWS, GCP, Azure)
   · Tokens de plataforma (GitHub, GitLab, Slack, Telegram, Discord)
   · Pasarelas de pago (Stripe, PayPal, Braintree)
@@ -22,6 +22,10 @@ Detecta más de 60 patrones de secretos reales organizados en categorías:
   · Servicios de correo y comunicaciones (SendGrid, Twilio, Mailgun)
   · Patrones genéricos de alta entropía (password=, api_key=, secret=…)
   · JWT y tokens Bearer
+  · PII financiera: tarjetas de crédito/débito (Visa, MC, Amex, Discover),
+    IBAN/BIC bancarios, CCC español, CVV/CVC hardcodeados
+  · PII de identidad: SSN EE.UU., DNI/NIE/CIF español, NHS UK
+  · PII de contacto: email en contexto sensible, teléfonos ES e internacionales
 
 Complementa la detección por regex con un análisis de entropía de
 Shannon sobre cadenas en asignaciones, lo que permite capturar secretos
@@ -57,11 +61,15 @@ ARQUITECTURA DE EJECUCIÓN (3 fases)
 
 MODELO DE SEVERIDAD
 -------------------
-  CRÍTICO — Clave activa verificable por formato: AWS AKIA, PEM privada,
-            Stripe sk_live_, Telegram BOT_TOKEN, WireGuard PrivateKey.
-  ALTO    — Token de plataforma: GitHub PAT, GitLab, Slack xoxb, JWT.
-  MEDIO   — Patrón genérico: password=, secret=, api_key= con valor.
-  BAJO    — Alta entropía en contexto de asignación (posible secreto).
+  CRÍTICO — Clave activa verificable por formato (AWS AKIA, PEM privada,
+            Stripe sk_live_, Telegram BOT_TOKEN, WireGuard PrivateKey)
+            o dato financiero/personal de alto impacto (PAN de tarjeta,
+            IBAN, SSN EE.UU., CVV).
+  ALTO    — Token de plataforma (GitHub PAT, GitLab, Slack, JWT) o dato
+            de identidad regulado (DNI, NIE, CIF, BIC/SWIFT).
+  MEDIO   — Patrón genérico con valor (password=, secret=, api_key=).
+  BAJO    — Alta entropía o dato de contacto en contexto sensible
+            (email=, teléfono).
 
 DEPENDENCIAS
 ------------
@@ -275,6 +283,53 @@ _RAW_PATTERNS: List[Dict[str, str]] = [
      "regex": r"shpss_[A-Fa-f0-9]{32}"},
     {"name": "HubSpot API Key",            "severity": "HIGH",     "category": "CRM · HubSpot",
      "regex": r"(?i)hubspot.{0,20}['\"]([A-Za-z0-9\-]{36})['\"]"},
+
+    # ── Datos personales y financieros (PII / PCI DSS) ───────────────────────
+    # Tarjetas de crédito/débito — PAN (Primary Account Number)
+    # Exige separadores (espacio o guión) para reducir falsos positivos.
+    # Se detectan los rangos BIN de los principales emisores.
+    {"name": "Tarjeta Visa",               "severity": "CRITICAL", "category": "PII · Tarjeta de pago",
+     "regex": r"(?<!\d)4[0-9]{3}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}(?!\d)"},
+    {"name": "Tarjeta Mastercard",         "severity": "CRITICAL", "category": "PII · Tarjeta de pago",
+     "regex": r"(?<!\d)5[1-5][0-9]{2}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}(?!\d)"},
+    {"name": "Tarjeta American Express",   "severity": "CRITICAL", "category": "PII · Tarjeta de pago",
+     "regex": r"(?<!\d)3[47][0-9]{2}[\s\-]?[0-9]{6}[\s\-]?[0-9]{5}(?!\d)"},
+    {"name": "Tarjeta Discover",           "severity": "CRITICAL", "category": "PII · Tarjeta de pago",
+     "regex": r"(?<!\d)6(?:011|5[0-9]{2})[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}(?!\d)"},
+    {"name": "CVV/CVC hardcodeado",        "severity": "CRITICAL", "category": "PII · Tarjeta de pago",
+     "regex": r"(?i)(?:cvv|cvc|csc|cvv2|cvc2)\s*[:=]\s*['\"]?([0-9]{3,4})['\"]?"},
+
+    # IBAN — Número Internacional de Cuenta Bancaria
+    # Cobre los 30+ países del espacio SEPA más los principales internacionales.
+    # Formato: 2 letras de país + 2 dígitos de control + BBAN variable.
+    {"name": "IBAN bancario",              "severity": "CRITICAL", "category": "PII · Cuenta bancaria",
+     "regex": r"\b(ES|GB|DE|FR|IT|NL|BE|PT|AT|CH|SE|NO|DK|FI|PL|CZ|HU|RO|HR|BG|SK|SI|LT|LV|EE|MT|CY|LU|IE|GR|AD|MC|SM|VA|IS|LI)[0-9]{2}[\s]?[0-9A-Z]{4}[\s]?[0-9A-Z]{4}[\s]?[0-9A-Z]{4}[\s]?[0-9A-Z]{0,14}\b"},
+    {"name": "BIC/SWIFT bancario",         "severity": "HIGH",     "category": "PII · Cuenta bancaria",
+     "regex": r"\b[A-Z]{4}(ES|GB|DE|FR|IT|NL|BE|PT|US|CH|JP|CN|AU|CA|SG|HK|AE|SA|BR)[A-Z0-9]{2}([A-Z0-9]{3})?\b"},
+
+    # Número de Seguridad Social y documentos de identidad
+    {"name": "SSN EE.UU.",                 "severity": "CRITICAL", "category": "PII · Identidad",
+     "regex": r"(?<!\d)(?!000|666|9\d{2})[0-9]{3}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}(?!\d)"},
+    {"name": "DNI español",                "severity": "HIGH",     "category": "PII · Identidad",
+     "regex": r"(?<!\d)(?!00000000)[0-9]{8}[TRWAGMYFPDXBNJZSQVHLCKE](?!\w)"},
+    {"name": "NIE español",                "severity": "HIGH",     "category": "PII · Identidad",
+     "regex": r"(?<!\w)[XYZ][0-9]{7}[TRWAGMYFPDXBNJZSQVHLCKE](?!\w)"},
+    {"name": "NIF/CIF empresa española",   "severity": "HIGH",     "category": "PII · Identidad",
+     "regex": r"(?<!\w)[ABCDEFGHJNPQRSUVW][0-9]{7}[0-9A-J](?!\w)"},
+    {"name": "NHS UK (número paciente)",   "severity": "CRITICAL", "category": "PII · Salud",
+     "regex": r"(?<!\d)[0-9]{3}[\s\-][0-9]{3}[\s\-][0-9]{4}(?!\d)"},
+
+    # Datos de contacto en contextos sensibles (volcados de BD, logs, configs)
+    {"name": "Email en contexto sensible", "severity": "LOW",      "category": "PII · Contacto",
+     "regex": r"(?i)(?:email|correo|mail|e-mail)\s*[:=]\s*['\"]?([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})['\"]?"},
+    {"name": "Teléfono español",           "severity": "LOW",      "category": "PII · Contacto",
+     "regex": r"(?<!\d)(?:\+34|0034)?[\s\-]?[6-9][0-9]{2}[\s\-]?[0-9]{3}[\s\-]?[0-9]{3}(?!\d)"},
+    {"name": "Teléfono internacional",     "severity": "LOW",      "category": "PII · Contacto",
+     "regex": r"(?<!\d)\+(?!34)[1-9][0-9]{1,2}[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{2,4}(?!\d)"},
+
+    # Números de cuenta / referencia financiera en contexto
+    {"name": "Número de cuenta bancaria ES (CCC)", "severity": "HIGH", "category": "PII · Cuenta bancaria",
+     "regex": r"(?<!\d)[0-9]{4}[\s\-][0-9]{4}[\s\-][0-9]{2}[\s\-][0-9]{10}(?!\d)"},
 
     # ── Patrones genéricos (alta cobertura, más falsos positivos) ─────────────
     {"name": "Contraseña hardcodeada",     "severity": "MEDIUM",   "category": "Genérico",
