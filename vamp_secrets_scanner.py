@@ -316,6 +316,12 @@ _RAW_PATTERNS: List[Dict[str, str]] = [
      "regex": r"(?<!\w)[XYZ][0-9]{7}[TRWAGMYFPDXBNJZSQVHLCKE](?!\w)"},
     {"name": "NIF/CIF empresa española",   "severity": "HIGH",     "category": "PII · Identidad",
      "regex": r"(?<!\w)[ABCDEFGHJNPQRSUVW][0-9]{7}[0-9A-J](?!\w)"},
+    # NUSS — Número de la Seguridad Social español
+    # Formato: 2 dígitos de provincia (01-52) + 8 de secuencia + 2 de control = 12 dígitos.
+    # Admite separadores (/  o  -) entre los tres grupos, que es la presentación
+    # oficial en documentos físicos (p.ej. 28/12345678/20).
+    {"name": "NUSS (Seg. Social español)", "severity": "CRITICAL", "category": "PII · Identidad",
+     "regex": r"(?<!\d)(0[1-9]|[1-4][0-9]|5[0-2])[/\-\s]?[0-9]{8}[/\-\s]?[0-9]{2}(?!\d)"},
     {"name": "NHS UK (número paciente)",   "severity": "CRITICAL", "category": "PII · Salud",
      "regex": r"(?<!\d)[0-9]{3}[\s\-][0-9]{3}[\s\-][0-9]{4}(?!\d)"},
 
